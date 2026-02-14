@@ -20,6 +20,11 @@ install(PROGRAMS
   scripts/mixer_pid_node.py
   DESTINATION lib/${PROJECT_NAME}
 )
+# Install launch files.
+install(DIRECTORY
+  launch
+  DESTINATION share/${PROJECT_NAME}
+)
 
 if(BUILD_TESTING)
   find_package(ament_lint_auto REQUIRED)
