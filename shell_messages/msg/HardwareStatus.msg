@@ -1,0 +1,4 @@
+bool is_armed
+bool leak_detected
+float32 battery_voltage
+string last_error
