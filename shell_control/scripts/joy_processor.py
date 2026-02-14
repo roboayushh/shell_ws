@@ -28,7 +28,7 @@ class JoyProcessor(Node):
         # Right Stick Up/Down = Pitch
         try:
             control_msg.surge = msg.axes[1]  # Forward/Back
-            control_msg.yaw   = msg.axes[0]  # Left/Right
+            control_msg.yaw   = msg.axes[3]  # Left/Right
             control_msg.pitch = msg.axes[4]  # Tilt Up/Down
             
             self.publisher.publish(control_msg)

@@ -4,124 +4,152 @@ from rclpy.node import Node
 import serial
 import threading
 import time
+import struct
 from shell_messages.msg import ThrusterSignals, HardwareStatus
+
+# --- CONFIG ---
+# This matches the Magic Bytes in Arduino
+CMD_ARM_SYSTEM = b'\xAA\x55\xAA\x55' 
+BAUD_RATE = 115200
 
 class SerialBridgeNode(Node):
     def __init__(self):
         super().__init__('serial_bridge_node')
 
-        # 1. Serial Config
-        self.declare_parameter('port', '/dev/sensors/arduino')
+        self.declare_parameter('port', '/dev/ttyACM0')
         self.port = self.get_parameter('port').value
-        self.baud = 115200
-        self.ser = None
-
-        # 2. State & Buffering (Single-Slot LIFO)
+        
+        # Internal State
         self.latest_pwm = [1500, 1500, 1500, 1500]
-        self.data_lock = threading.Lock()
-        self.is_arduino_online = False
-
-        # 3. ROS Comms
-        self.thruster_sub = self.create_subscription(
-            ThrusterSignals, '/thruster_signals', self.thruster_callback, 10)
-        self.status_pub = self.create_publisher(HardwareStatus, '/hw_status', 10)
-
-        # 4. Background Serial Thread
+        self.lock = threading.Lock()
+        self.ser = None
+        self.hardware_state = "DISCONNECTED" # States: DISCONNECTED, WAITING_HANDSHAKE, ARMED
         self.running = True
-        self.serial_thread = threading.Thread(target=self.serial_handler, daemon=True)
-        self.serial_thread.start()
 
-        self.get_logger().info(f"Bridge started on {self.port} at {self.baud}")
+        # ROS Setup
+        self.sub = self.create_subscription(
+            ThrusterSignals, '/thruster_signals', self.pwm_callback, 10)
+        self.pub_status = self.create_publisher(HardwareStatus, '/hw_status', 10)
 
-    def thruster_callback(self, msg):
-        """Single-slot buffer: always overwrite with the newest data."""
-        with self.data_lock:
-            self.latest_pwm = list(msg.pwm_values)
+        # Start the Serial Thread
+        self.io_thread = threading.Thread(target=self.serial_io_loop, daemon=True)
+        self.io_thread.start()
+
+        self.get_logger().info(f"Initialized. Waiting for Arduino on {self.port}...")
+
+    def pwm_callback(self, msg):
+        with self.lock:
+            self.latest_pwm = list(msg.pwm_values)[:4]
 
     def cobs_encode(self, data):
-        """Consistent Overhead Byte Stuffing to remove 0x00."""
-        res = bytearray([0])
-        ptr = 0
-        for i, b in enumerate(data):
-            if b == 0:
-                res[ptr] = i - ptr + 1
-                ptr = len(res)
-                res.append(0)
+        output = bytearray()
+        idx = 0
+        while idx < len(data):
+            next_zero = -1
+            for i in range(idx, min(idx + 254, len(data))):
+                if data[i] == 0:
+                    next_zero = i
+                    break
+            
+            if next_zero == -1:
+                code = min(254, len(data) - idx) + 1
+                output.append(code)
+                output.extend(data[idx:idx + code - 1])
+                idx += code - 1
             else:
-                res.append(b)
-        res[ptr] = len(res) - ptr
-        res.append(0) # The delimiter
-        return res
+                code = next_zero - idx + 1
+                output.append(code)
+                output.extend(data[idx:next_zero])
+                idx = next_zero + 1
+        output.append(0)
+        return output
 
-    def serial_handler(self):
-        last_read_time = time.time()
-        
+    def serial_io_loop(self):
         while self.running:
-            if self.ser is None or not self.ser.is_open:
-                self.is_arduino_online = False
+            # --- 1. Connection Handling ---
+            if self.ser is None:
                 try:
-                    self.ser = serial.Serial(self.port, self.baud, timeout=0) # Timeout 0 for non-blocking
-                    self.get_logger().info("Serial Port Opened.")
-                except Exception as e:
+                    self.ser = serial.Serial(self.port, BAUD_RATE, timeout=0.05)
+                    self.get_logger().info(f"Port Opened: {self.port}")
+                    self.hardware_state = "WAITING_HANDSHAKE"
+                    self.ser.reset_input_buffer()
+                except serial.SerialException:
+                    self.publish_status("NO_PORT")
                     time.sleep(1.0)
                     continue
 
-            # --- WRITE STEP ---
-            with self.data_lock:
-                raw_payload = bytearray()
-                for val in self.latest_pwm:
-                    raw_payload.extend(val.to_bytes(2, 'little'))
-                
-                checksum = sum(raw_payload) % 256
-                raw_payload.append(checksum)
-                encoded_packet = self.cobs_encode(raw_payload)
-                
-                try:
-                    self.ser.write(encoded_packet)
-                except serial.SerialException:
-                    self.ser = None # Trigger reconnect
-                    continue
-
-            # --- READ STEP (Non-blocking) ---
+            # --- 2. Read Incoming Data (Handshakes) ---
             try:
-                if self.ser.in_waiting > 0:
-                    # Read what's available without waiting for a newline
-                    data = self.ser.read(self.ser.in_waiting).decode('utf-8', errors='ignore')
-                    for line in data.split('\r\n'):
-                        if line:
-                            self.process_arduino_feedback(line)
-                            last_read_time = time.time()
-                            self.is_arduino_online = True
+                if self.ser.in_waiting:
+                    line = self.ser.readline().decode('utf-8', errors='ignore').strip()
+                    if line:
+                        self.handle_arduino_message(line)
             except Exception as e:
-                self.get_logger().warn(f"Read error: {e}")
-
-            # --- HEARTBEAT CHECK ---
-            # If we haven't heard from Arduino in 2s, tell ROS it's offline
-            if time.time() - last_read_time > 2.0:
-                if self.is_arduino_online:
-                    self.get_logger().error("Arduino Heartbeat Lost!")
-                    self.is_arduino_online = False
-                msg = HardwareStatus()
-                msg.is_armed = False
-                msg.last_error = "Hardware Offline"
-                self.status_pub.publish(msg)
-
-            time.sleep(0.02) # Rigid 50Hz
-
-    def process_arduino_feedback(self, line):
-        msg = HardwareStatus()
-        if "STATUS_ARMED" in line:
-            msg.is_armed = True
-        elif "STATUS_DISARMED" in line:
-            msg.is_armed = False
-        
-        # In future, parse battery from string like "VOLT:12.4"
-        if "VOLT:" in line:
-            try:
-                msg.battery_voltage = float(line.split(":")[1])
-            except: pass
+                self.get_logger().error(f"Read Error: {e}")
+                self.close_serial()
+                continue
             
-        self.status_pub.publish(msg)
+            # --- 3. Write Outgoing Data (PWM) ---
+            # We ONLY send data if we are fully ARMED.
+            if self.hardware_state == "ARMED":
+                try:
+                    with self.lock:
+                        current_pwm = self.latest_pwm
+                    
+                    # Pack 4x uint16 (Little Endian)
+                    payload = bytearray(struct.pack('<4H', *current_pwm))
+                    
+                    # Calculate Checksum (Sum % 256)
+                    checksum = sum(payload) % 256
+                    payload.append(checksum)
+                    
+                    # Encode and Send
+                    packet = self.cobs_encode(payload)
+                    self.ser.write(packet)
+                    
+                except Exception as e:
+                    self.get_logger().error(f"Write Error: {e}")
+                    self.close_serial()
+
+            time.sleep(0.02) # Run at 50Hz
+
+    def handle_arduino_message(self, line):
+        # LOGIC:
+        # If we see BOOT_OK, Arduino is begging for config. Send ARM command.
+        # This works even if we *thought* we were ARMED (self-healing).
+        
+        if "BOOT_OK" in line:
+            if self.hardware_state != "WAITING_HANDSHAKE":
+                self.get_logger().warn("Arduino Reset Detected! Re-sending ARM command.")
+            
+            # Send Arm Command (COBS Encoded)
+            encoded_cmd = self.cobs_encode(CMD_ARM_SYSTEM)
+            self.ser.write(encoded_cmd)
+            self.hardware_state = "WAITING_HANDSHAKE"
+
+        elif "ARM_CONFIRMED" in line:
+            self.get_logger().info("Arduino Armed! Starting Data Stream.")
+            self.hardware_state = "ARMED"
+
+        elif "STATUS_DISARMED" in line:
+            self.get_logger().warn("Arduino reports DISARMED. Waiting for BOOT_OK...")
+            self.hardware_state = "WAITING_HANDSHAKE"
+
+        # Publish status to ROS network
+        self.publish_status(line)
+
+    def publish_status(self, msg_text):
+        msg = HardwareStatus()
+        msg.is_armed = (self.hardware_state == "ARMED")
+        msg.last_error = msg_text
+        self.pub_status.publish(msg)
+
+    def close_serial(self):
+        if self.ser:
+            self.ser.close()
+        self.ser = None
+        self.hardware_state = "DISCONNECTED"
+        self.publish_status("DISCONNECTED")
 
     def stop(self):
         self.running = False
@@ -133,10 +161,12 @@ def main():
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
-        node.stop()
+        pass
     finally:
-        node.destroy_node()
-        rclpy.shutdown()
+        node.stop()
+        if rclpy.ok():
+            node.destroy_node()
+            rclpy.shutdown()
 
 if __name__ == '__main__':
     main()
