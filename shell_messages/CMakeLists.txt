@@ -16,6 +16,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/Control3DOF.msg"
   "msg/ThrusterSignals.msg"
   "msg/HardwareStatus.msg"
+  "msg/SensorTelemetry.msg"
 )
 
 if(BUILD_TESTING)

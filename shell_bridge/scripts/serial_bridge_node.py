@@ -5,33 +5,45 @@ import serial
 import threading
 import time
 import struct
-from shell_messages.msg import ThrusterSignals, HardwareStatus
+from shell_messages.msg import ThrusterSignals, HardwareStatus, SensorTelemetry
 
 # --- CONFIG ---
-# This matches the Magic Bytes in Arduino
 CMD_ARM_SYSTEM = b'\xAA\x55\xAA\x55' 
 BAUD_RATE = 115200
+
+# Binary Packet Config (Must match Arduino Struct)
+# '<' = Little Endian, 'ffffff' = 6 floats
+STRUCT_FORMAT = '<ffffff'
+PACKET_SIZE = 24  # 6 floats * 4 bytes
+HEADER_SIZE = 2   # 0xAA 0xBB
+TOTAL_MSG_SIZE = PACKET_SIZE + HEADER_SIZE
 
 class SerialBridgeNode(Node):
     def __init__(self):
         super().__init__('serial_bridge_node')
 
-        self.declare_parameter('port', '/dev/control_arduino')
+        self.declare_parameter('port', '/dev/led_arduino')
         self.port = self.get_parameter('port').value
         
         # Internal State
         self.latest_pwm = [1500, 1500, 1500, 1500]
         self.lock = threading.Lock()
         self.ser = None
-        self.hardware_state = "DISCONNECTED" # States: DISCONNECTED, WAITING_HANDSHAKE, ARMED
+        self.hardware_state = "DISCONNECTED"
         self.running = True
+
+        # --- BUFFER FOR HYBRID PARSING ---
+        self.rx_buffer = bytearray() 
 
         # ROS Setup
         self.sub = self.create_subscription(
             ThrusterSignals, '/thruster_signals', self.pwm_callback, 10)
         self.pub_status = self.create_publisher(HardwareStatus, '/hw_status', 10)
+        
+        # NEW: Sensor Publisher
+        self.pub_sensors = self.create_publisher(SensorTelemetry, '/sensors/telemetry', 10)
 
-        # Start the Serial Thread
+        # Start Serial Thread
         self.io_thread = threading.Thread(target=self.serial_io_loop, daemon=True)
         self.io_thread.start()
 
@@ -73,37 +85,37 @@ class SerialBridgeNode(Node):
                     self.get_logger().info(f"Port Opened: {self.port}")
                     self.hardware_state = "WAITING_HANDSHAKE"
                     self.ser.reset_input_buffer()
+                    self.rx_buffer.clear() # Clear buffer on reconnect
                 except serial.SerialException:
                     self.publish_status("NO_PORT")
                     time.sleep(1.0)
                     continue
 
-            # --- 2. Read Incoming Data (Handshakes) ---
+            # --- 2. HYBRID READ (Text + Binary) ---
             try:
                 if self.ser.in_waiting:
-                    line = self.ser.readline().decode('utf-8', errors='ignore').strip()
-                    if line:
-                        self.handle_arduino_message(line)
+                    # Read everything available and append to our buffer
+                    chunk = self.ser.read(self.ser.in_waiting)
+                    self.rx_buffer.extend(chunk)
+                    
+                    # Process the buffer until we can't anymore
+                    self.process_buffer()
+
             except Exception as e:
                 self.get_logger().error(f"Read Error: {e}")
                 self.close_serial()
                 continue
             
             # --- 3. Write Outgoing Data (PWM) ---
-            # We ONLY send data if we are fully ARMED.
             if self.hardware_state == "ARMED":
                 try:
                     with self.lock:
                         current_pwm = self.latest_pwm
                     
-                    # Pack 4x uint16 (Little Endian)
                     payload = bytearray(struct.pack('<4H', *current_pwm))
-                    
-                    # Calculate Checksum (Sum % 256)
                     checksum = sum(payload) % 256
                     payload.append(checksum)
                     
-                    # Encode and Send
                     packet = self.cobs_encode(payload)
                     self.ser.write(packet)
                     
@@ -111,18 +123,84 @@ class SerialBridgeNode(Node):
                     self.get_logger().error(f"Write Error: {e}")
                     self.close_serial()
 
-            time.sleep(0.02) # Run at 50Hz
+            time.sleep(0.02) # 50Hz Loop
 
-    def handle_arduino_message(self, line):
-        # LOGIC:
-        # If we see BOOT_OK, Arduino is begging for config. Send ARM command.
-        # This works even if we *thought* we were ARMED (self-healing).
-        
+    # --- NEW: BUFFER PROCESSOR ---
+    def process_buffer(self):
+        """
+        Scans self.rx_buffer for either:
+        1. Binary Packets (Start with 0xAA 0xBB)
+        2. Text Lines (End with \n)
+        """
+        while len(self.rx_buffer) > 0:
+            
+            # Check for Binary Header (0xAA, 0xBB)
+            if len(self.rx_buffer) >= 2 and self.rx_buffer[0] == 0xAA and self.rx_buffer[1] == 0xBB:
+                if len(self.rx_buffer) >= TOTAL_MSG_SIZE:
+                    # We have a full binary packet!
+                    packet_bytes = self.rx_buffer[2:TOTAL_MSG_SIZE] # Skip header
+                    self.parse_binary_sensor(packet_bytes)
+                    
+                    # Remove this packet from buffer
+                    del self.rx_buffer[0:TOTAL_MSG_SIZE]
+                    continue
+                else:
+                    # Header found, but not enough data yet. Wait for next loop.
+                    break
+
+            # Check for Text (Newlines) if it's NOT a binary header
+            try:
+                # Look for a newline char
+                nl_idx = self.rx_buffer.find(b'\n')
+                
+                if nl_idx != -1:
+                    # We found a text line!
+                    line_bytes = self.rx_buffer[:nl_idx]
+                    line_str = line_bytes.decode('utf-8', errors='ignore').strip()
+                    
+                    if line_str:
+                        self.handle_arduino_text(line_str)
+                    
+                    # Remove the line + newline char from buffer
+                    del self.rx_buffer[0:nl_idx+1]
+                    continue
+            except Exception:
+                pass # Decoding error, just move on
+
+            # GARBAGE COLLECTION
+            # If start byte is NOT 0xAA, and we didn't find a newline nearby, it's likely noise.
+            # Pop the first byte to shift the window and try finding sync again.
+            if self.rx_buffer[0] != 0xAA:
+                del self.rx_buffer[0]
+            else:
+                # If it IS 0xAA but we didn't have enough data (handled above), break to wait for more.
+                break
+
+    def parse_binary_sensor(self, data_bytes):
+        try:
+            # Unpack the 6 floats
+            roll, pitch, yaw, temp, hum, volt = struct.unpack(STRUCT_FORMAT, data_bytes)
+            
+            msg = SensorTelemetry()
+            msg.roll = roll
+            msg.pitch = pitch
+            msg.yaw = yaw
+            msg.temperature = temp
+            msg.humidity = hum
+            msg.voltage = volt
+            
+            self.pub_sensors.publish(msg)
+            
+        except struct.error as e:
+            self.get_logger().warn(f"Struct Unpack Error: {e}")
+
+    def handle_arduino_text(self, line):
+        # LOGIC: IDLE -> ARMING -> ARMED
         if "BOOT_OK" in line:
             if self.hardware_state != "WAITING_HANDSHAKE":
                 self.get_logger().warn("Arduino Reset Detected! Re-sending ARM command.")
             
-            # Send Arm Command (COBS Encoded)
+            # Send Arm Command
             encoded_cmd = self.cobs_encode(CMD_ARM_SYSTEM)
             self.ser.write(encoded_cmd)
             self.hardware_state = "WAITING_HANDSHAKE"
@@ -132,10 +210,9 @@ class SerialBridgeNode(Node):
             self.hardware_state = "ARMED"
 
         elif "STATUS_DISARMED" in line:
-            self.get_logger().warn("Arduino reports DISARMED. Waiting for BOOT_OK...")
+            self.get_logger().warn("Arduino reports DISARMED.")
             self.hardware_state = "WAITING_HANDSHAKE"
 
-        # Publish status to ROS network
         self.publish_status(line)
 
     def publish_status(self, msg_text):
