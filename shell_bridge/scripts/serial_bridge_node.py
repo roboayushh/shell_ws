@@ -22,7 +22,7 @@ class SerialBridgeNode(Node):
     def __init__(self):
         super().__init__('serial_bridge_node')
 
-        self.declare_parameter('port', '/dev/led_arduino')
+        self.declare_parameter('port', '/dev/control_arduino')
         self.port = self.get_parameter('port').value
         
         # Internal State

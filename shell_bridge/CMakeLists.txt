@@ -16,6 +16,7 @@ find_package(shell_messages REQUIRED)
 
 install(PROGRAMS
   scripts/serial_bridge_node.py
+  scripts/display_bridge_node.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
