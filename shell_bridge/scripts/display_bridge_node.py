@@ -5,18 +5,17 @@ import serial
 import struct
 import threading
 import time
+import os  #
 from shell_messages.msg import SensorTelemetry
 
 # --- CONFIG ---
-# Protocol: Header (2 bytes) + 6 Floats (24 bytes) = 26 Bytes Total
 HEADER = b'\xAA\xBB'
-CMD_START_STREAM = b'\xA5' # Simple 1-byte command to tell Arduino "I am here"
+CMD_START_STREAM = b'\xA5'
 
 class DisplayBridgeNode(Node):
     def __init__(self):
         super().__init__('display_bridge_node')
-
-        # Port for the DISPLAY Arduino (NOT the Thruster Arduino)
+        
         self.declare_parameter('display_port', '/dev/lcd_arduino') 
         self.port = self.get_parameter('display_port').value
         self.baud_rate = 115200
@@ -25,23 +24,21 @@ class DisplayBridgeNode(Node):
         self.connected = False
         self.lock = threading.Lock()
 
-        # Subscribe to the sensor data coming from the Thruster Arduino
         self.subscription = self.create_subscription(
             SensorTelemetry,
             '/sensors/telemetry',
             self.listener_callback,
             10)
 
-        # Start Connection Thread
         self.connect_thread = threading.Thread(target=self.connection_loop, daemon=True)
         self.connect_thread.start()
 
     def connection_loop(self):
-        """ Handles the Handshake: Wait for BOOT_OK -> Send Start Command """
         while rclpy.ok():
+            # 1. Connect if not connected
             if self.ser is None:
                 try:
-                    self.ser = serial.Serial(self.port, self.baud_rate, timeout=1)
+                    self.ser = serial.Serial(self.port, self.baud_rate, timeout=0.1)
                     self.get_logger().info(f"Display Port Opened: {self.port}")
                     self.connected = False
                 except serial.SerialException:
@@ -49,33 +46,37 @@ class DisplayBridgeNode(Node):
                     time.sleep(2)
                     continue
 
-            # Handshake Logic
+            # 2. Read Serial Data (Handshake + Commands)
             try:
                 if self.ser.in_waiting:
                     line = self.ser.readline().decode('utf-8', errors='ignore').strip()
+                    
+                    # Handshake
                     if "BOOT_OK" in line:
-                        self.get_logger().info("Display Arduino Found! Sending Start Command...")
+                        self.get_logger().info("Handshake Received. Sending Start Command...")
                         self.ser.write(CMD_START_STREAM)
                         self.connected = True
+                    
+                    # --- KILL SWITCH LOGIC ---
+                    elif "KILL_SYSTEM" in line:
+                        self.get_logger().fatal("!!! KILL SWITCH ACTIVATED - SHUTTING DOWN !!!")
+                        # Kills all ROS nodes and shuts down the Pi
+                        os.system("shutdown -h now") 
+            
             except Exception as e:
                 self.ser = None
                 self.connected = False
             
-            time.sleep(0.1)
+            time.sleep(0.05)
 
     def listener_callback(self, msg):
-        """ Received Sensor Data from ROS -> Pack Binary -> Send to Display """
         if not self.connected or self.ser is None:
             return
 
         try:
-            # 1. Pack data into binary (Same format as Arduino struct)
-            # < = Little Endian, ffffff = 6 floats
             payload = struct.pack('<ffffff', 
                                   msg.roll, msg.pitch, msg.yaw, 
                                   msg.temperature, msg.humidity, msg.voltage)
-
-            # 2. Send Header + Payload
             with self.lock:
                 self.ser.write(HEADER)
                 self.ser.write(payload)
