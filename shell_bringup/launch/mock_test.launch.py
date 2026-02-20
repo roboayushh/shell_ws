@@ -43,11 +43,11 @@ def generate_launch_description():
         ),
 
         # 5. Start Display Bridge (LCD Arduino)
-        Node(
-            package='shell_bridge',
-            executable='display_bridge_node.py',
-            name='display_bridge_node',
-            parameters=[{'display_port': '/dev/lcd_arduino'}],
-            output='screen'
-        )
+        # Node(
+        #     package='shell_bridge',
+        #     executable='display_bridge_node.py',
+        #     name='display_bridge_node',
+        #     parameters=[{'display_port': '/dev/lcd_arduino'}],
+        #     output='screen'
+        # )
     ])

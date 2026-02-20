@@ -12,9 +12,9 @@ CMD_ARM_SYSTEM = b'\xAA\x55\xAA\x55'
 BAUD_RATE = 115200
 
 # Binary Packet Config (Must match Arduino Struct)
-# '<' = Little Endian, 'ffffff' = 6 floats
-STRUCT_FORMAT = '<ffffff'
-PACKET_SIZE = 24  # 6 floats * 4 bytes
+# '<' = Little Endian, 'fff' = 3 floats
+STRUCT_FORMAT = '<fff'
+PACKET_SIZE = 12  # 3 floats * 4 bytes
 HEADER_SIZE = 2   # 0xAA 0xBB
 TOTAL_MSG_SIZE = PACKET_SIZE + HEADER_SIZE
 
@@ -39,8 +39,6 @@ class SerialBridgeNode(Node):
         self.sub = self.create_subscription(
             ThrusterSignals, '/thruster_signals', self.pwm_callback, 10)
         self.pub_status = self.create_publisher(HardwareStatus, '/hw_status', 10)
-        
-        # NEW: Sensor Publisher
         self.pub_sensors = self.create_publisher(SensorTelemetry, '/sensors/telemetry', 10)
 
         # Start Serial Thread
@@ -94,11 +92,8 @@ class SerialBridgeNode(Node):
             # --- 2. HYBRID READ (Text + Binary) ---
             try:
                 if self.ser.in_waiting:
-                    # Read everything available and append to our buffer
                     chunk = self.ser.read(self.ser.in_waiting)
                     self.rx_buffer.extend(chunk)
-                    
-                    # Process the buffer until we can't anymore
                     self.process_buffer()
 
             except Exception as e:
@@ -125,66 +120,41 @@ class SerialBridgeNode(Node):
 
             time.sleep(0.02) # 50Hz Loop
 
-    # --- NEW: BUFFER PROCESSOR ---
+    # --- BUFFER PROCESSOR ---
     def process_buffer(self):
-        """
-        Scans self.rx_buffer for either:
-        1. Binary Packets (Start with 0xAA 0xBB)
-        2. Text Lines (End with \n)
-        """
         while len(self.rx_buffer) > 0:
-            
-            # Check for Binary Header (0xAA, 0xBB)
             if len(self.rx_buffer) >= 2 and self.rx_buffer[0] == 0xAA and self.rx_buffer[1] == 0xBB:
                 if len(self.rx_buffer) >= TOTAL_MSG_SIZE:
-                    # We have a full binary packet!
-                    packet_bytes = self.rx_buffer[2:TOTAL_MSG_SIZE] # Skip header
+                    packet_bytes = self.rx_buffer[2:TOTAL_MSG_SIZE] 
                     self.parse_binary_sensor(packet_bytes)
-                    
-                    # Remove this packet from buffer
                     del self.rx_buffer[0:TOTAL_MSG_SIZE]
                     continue
                 else:
-                    # Header found, but not enough data yet. Wait for next loop.
                     break
 
-            # Check for Text (Newlines) if it's NOT a binary header
             try:
-                # Look for a newline char
                 nl_idx = self.rx_buffer.find(b'\n')
-                
                 if nl_idx != -1:
-                    # We found a text line!
                     line_bytes = self.rx_buffer[:nl_idx]
                     line_str = line_bytes.decode('utf-8', errors='ignore').strip()
-                    
                     if line_str:
                         self.handle_arduino_text(line_str)
-                    
-                    # Remove the line + newline char from buffer
                     del self.rx_buffer[0:nl_idx+1]
                     continue
             except Exception:
-                pass # Decoding error, just move on
+                pass
 
-            # GARBAGE COLLECTION
-            # If start byte is NOT 0xAA, and we didn't find a newline nearby, it's likely noise.
-            # Pop the first byte to shift the window and try finding sync again.
             if self.rx_buffer[0] != 0xAA:
                 del self.rx_buffer[0]
             else:
-                # If it IS 0xAA but we didn't have enough data (handled above), break to wait for more.
                 break
 
     def parse_binary_sensor(self, data_bytes):
         try:
-            # Unpack the 6 floats
-            roll, pitch, yaw, temp, hum, volt = struct.unpack(STRUCT_FORMAT, data_bytes)
+            # Unpack 3 floats
+            temp, hum, volt = struct.unpack(STRUCT_FORMAT, data_bytes)
             
             msg = SensorTelemetry()
-            msg.roll = roll
-            msg.pitch = pitch
-            msg.yaw = yaw
             msg.temperature = temp
             msg.humidity = hum
             msg.voltage = volt
@@ -195,12 +165,9 @@ class SerialBridgeNode(Node):
             self.get_logger().warn(f"Struct Unpack Error: {e}")
 
     def handle_arduino_text(self, line):
-        # LOGIC: IDLE -> ARMING -> ARMED
         if "BOOT_OK" in line:
             if self.hardware_state != "WAITING_HANDSHAKE":
                 self.get_logger().warn("Arduino Reset Detected! Re-sending ARM command.")
-            
-            # Send Arm Command
             encoded_cmd = self.cobs_encode(CMD_ARM_SYSTEM)
             self.ser.write(encoded_cmd)
             self.hardware_state = "WAITING_HANDSHAKE"

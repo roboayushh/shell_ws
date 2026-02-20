@@ -30,9 +30,6 @@ MCUFRIEND_kbv tft;
 
 // --- DATA STRUCTURE ---
 struct __attribute__((packed)) SensorPacket {
-  float roll;
-  float pitch;
-  float yaw;
   float temp;
   float hum;
   float volt;
@@ -43,7 +40,7 @@ SensorPacket old_data;
 
 // --- STATE MACHINE ---
 bool is_connected = false;
-bool waiting_for_confirm = false; // Tracks if the popup is visible
+bool waiting_for_confirm = false; 
 unsigned long last_packet_time = 0;
 unsigned long last_touch_check = 0;
 
@@ -52,7 +49,6 @@ void drawInterface();
 void drawConfirmPopup();
 void drawLabel(int x, int y, const char* label);
 void updateValues();
-void drawAngle(int x, int y, float val, float *old_val);
 void checkTouch();
 
 void setup() {
@@ -61,7 +57,7 @@ void setup() {
   uint16_t ID = tft.readID();
   if (ID == 0xD3D3) ID = 0x9488; 
   tft.begin(ID);
-  tft.setRotation(1); // Landscape
+  tft.setRotation(1); 
   
   tft.fillScreen(BLACK);
   tft.setTextSize(3);
@@ -97,14 +93,19 @@ void loop() {
     return;
   }
 
-  // 3. Data Receiving Phase (Pause telemetry updates if popup is active)
-  if (Serial.available() >= 26 && !waiting_for_confirm) { 
-    if (Serial.read() == 0xAA) {
-      if (Serial.read() == 0xBB) {
+  // 3. Data Receiving Phase (Robust parsing to prevent crashes)
+  while (Serial.available() >= 14 && !waiting_for_confirm) { 
+    if (Serial.peek() == 0xAA) {
+      Serial.read(); // Consume 0xAA
+      if (Serial.peek() == 0xBB) {
+        Serial.read(); // Consume 0xBB
         Serial.readBytes((char*)&data, sizeof(data));
         last_packet_time = millis();
         updateValues();
       }
+    } else {
+      // Discard misaligned byte to prevent buffer overflow and UI freeze
+      Serial.read();
     }
   }
 
@@ -122,33 +123,26 @@ void loop() {
 void checkTouch() {
   TSPoint p = ts.getPoint();
   
-  // Restore shared pins for display
   pinMode(XM, OUTPUT);
   pinMode(YP, OUTPUT);
 
   if (p.z > MINPRESSURE && p.z < MAXPRESSURE) {
-    // Landscape Mapping based on your calibration
     int x = map(p.y, TS_TOP, TS_BOT, 0, 480);
     int y = map(p.x, TS_RT, TS_LEFT, 0, 320);
 
     if (!waiting_for_confirm) {
-      // Logic for Main Dashboard: Detect RED KILL button area
       if (x > 340 && y > 200) {
         waiting_for_confirm = true;
         drawConfirmPopup();
-        delay(300); // Debounce
+        delay(300); 
       }
     } else {
-      // Logic for Confirmation Popup: Detect OK or CANCEL
-      
-      // CANCEL Button (Left side)
       if (x > 60 && x < 220 && y > 180 && y < 260) {
         waiting_for_confirm = false;
         drawInterface();
         delay(300);
       }
       
-      // OK Button (Right side)
       if (x > 260 && x < 420 && y > 180 && y < 260) {
         tft.fillScreen(RED);
         tft.setTextColor(WHITE);
@@ -156,7 +150,7 @@ void checkTouch() {
         tft.setCursor(50, 140);
         tft.print("SHUTTING DOWN...");
         
-        Serial.println("KILL_SYSTEM"); // Signal to Python Bridge
+        Serial.println("KILL_SYSTEM"); 
         delay(5000); 
       }
     }
@@ -164,7 +158,6 @@ void checkTouch() {
 }
 
 void drawConfirmPopup() {
-  // Draw a modal-style box
   tft.fillRect(40, 60, 400, 220, DARKGREY);
   tft.drawRect(40, 60, 400, 220, WHITE);
 
@@ -173,12 +166,10 @@ void drawConfirmPopup() {
   tft.setCursor(65, 100);
   tft.print("CONFIRM SHUTDOWN?");
 
-  // Cancel Button (BLUE)
   tft.fillRect(60, 180, 160, 80, BLUE);
   tft.setCursor(85, 210);
   tft.print("CANCEL");
 
-  // OK Button (RED)
   tft.fillRect(260, 180, 160, 80, RED);
   tft.setCursor(315, 210);
   tft.print("OK");
@@ -187,37 +178,25 @@ void drawConfirmPopup() {
 void drawInterface() {
   tft.fillScreen(BLACK);
   
-  // Header
   tft.fillRect(0, 0, 480, 40, BLUE);
   tft.setTextColor(WHITE); tft.setTextSize(2);
   tft.setCursor(10, 12); tft.print("ROV TELEMETRY");
 
-  // Static Labels
   drawLabel(20, 60, "BATTERY");
   drawLabel(20, 140, "TEMP / HUM");
-  drawLabel(240, 60, "ORIENTATION");
   
-  // Units
   tft.setTextColor(WHITE);
   tft.setCursor(160, 90); tft.print("V");
   tft.setCursor(160, 170); tft.print("C");
   tft.setCursor(160, 200); tft.print("%");
-  tft.setCursor(380, 90); tft.print("R");
-  tft.setCursor(380, 120); tft.print("P");
-  tft.setCursor(380, 150); tft.print("Y");
 
-  // Main KILL Trigger Button
   tft.fillRect(340, 200, 120, 100, RED);
   tft.setTextColor(WHITE); tft.setTextSize(3);
   tft.setCursor(360, 240); tft.print("KILL");
   
-  // Force full refresh of values on interface redraw
   old_data.volt = -1.0;
   old_data.temp = -1.0;
   old_data.hum = -1.0;
-  old_data.roll = -999.0;
-  old_data.pitch = -999.0;
-  old_data.yaw = -999.0;
 }
 
 void drawLabel(int x, int y, const char* label) {
@@ -228,35 +207,20 @@ void drawLabel(int x, int y, const char* label) {
 }
 
 void updateValues() {
-  // BATTERY update
   if (abs(data.volt - old_data.volt) > 0.1) {
     tft.fillRect(20, 90, 130, 25, BLACK);
     tft.setTextColor(data.volt > 11.0 ? GREEN : RED);
     tft.setTextSize(3); tft.setCursor(20, 90); tft.print(data.volt, 1);
     old_data.volt = data.volt;
   }
-  // TEMP update
   if (abs(data.temp - old_data.temp) > 0.5) {
     tft.fillRect(20, 170, 130, 25, BLACK);
     tft.setTextColor(WHITE); tft.setTextSize(3); tft.setCursor(20, 170); tft.print(data.temp, 1);
     old_data.temp = data.temp;
   }
-  // HUMIDITY update
   if (abs(data.hum - old_data.hum) > 1.0) {
     tft.fillRect(20, 200, 130, 25, BLACK);
     tft.setTextColor(WHITE); tft.setTextSize(3); tft.setCursor(20, 200); tft.print(data.hum, 0);
     old_data.hum = data.hum;
-  }
-  // IMU Angles
-  drawAngle(240, 90, data.roll, &old_data.roll);
-  drawAngle(240, 120, data.pitch, &old_data.pitch);
-  drawAngle(240, 150, data.yaw, &old_data.yaw);
-}
-
-void drawAngle(int x, int y, float val, float *old_val) {
-  if (abs(val - *old_val) > 1.0) {
-    tft.fillRect(x, y, 130, 25, BLACK);
-    tft.setTextColor(MAGENTA); tft.setTextSize(3); tft.setCursor(x, y); tft.print(val, 0);
-    *old_val = val;
   }
 }

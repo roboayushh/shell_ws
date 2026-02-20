@@ -5,7 +5,7 @@ import serial
 import struct
 import threading
 import time
-import os  #
+import os
 from shell_messages.msg import SensorTelemetry
 
 # --- CONFIG ---
@@ -51,16 +51,13 @@ class DisplayBridgeNode(Node):
                 if self.ser.in_waiting:
                     line = self.ser.readline().decode('utf-8', errors='ignore').strip()
                     
-                    # Handshake
                     if "BOOT_OK" in line:
                         self.get_logger().info("Handshake Received. Sending Start Command...")
                         self.ser.write(CMD_START_STREAM)
                         self.connected = True
                     
-                    # --- KILL SWITCH LOGIC ---
                     elif "KILL_SYSTEM" in line:
                         self.get_logger().fatal("!!! KILL SWITCH ACTIVATED - SHUTTING DOWN !!!")
-                        # Kills all ROS nodes and shuts down the Pi
                         os.system("shutdown -h now") 
             
             except Exception as e:
@@ -74,9 +71,8 @@ class DisplayBridgeNode(Node):
             return
 
         try:
-            payload = struct.pack('<ffffff', 
-                                  msg.roll, msg.pitch, msg.yaw, 
-                                  msg.temperature, msg.humidity, msg.voltage)
+            # Packed as 3 floats (12 bytes)
+            payload = struct.pack('<fff', msg.temperature, msg.humidity, msg.voltage)
             with self.lock:
                 self.ser.write(HEADER)
                 self.ser.write(payload)

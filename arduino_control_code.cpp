@@ -4,7 +4,6 @@
  */
 
 #include <Servo.h>
-#include <Wire.h>
 #include <DHT.h>
 
 // --- CONFIGURATION: THRUSTERS ---
@@ -18,8 +17,6 @@ const int NEUTRAL_PWM = 1500;
 #define DHTPIN A2
 #define DHTTYPE DHT11
 #define VOLT_PIN A0
-#define IMU_ADDR 0x50
-#define REG_ANGLE 0x3D
 const float DIVIDER_FACTOR = 3.0;
 const unsigned long SENSOR_INTERVAL = 50; // Send data every 50ms (20Hz)
 
@@ -29,9 +26,6 @@ DHT dht(DHTPIN, DHTTYPE);
 
 // --- DATA STRUCTURES ---
 struct __attribute__((packed)) SensorPacket {
-  float roll;
-  float pitch;
-  float yaw;
   float temperature;
   float humidity;
   float voltage;
@@ -61,7 +55,7 @@ void process_frame(uint8_t* buf, int len);
 int cobs_decode(const uint8_t *ptr, int length, uint8_t *dst);
 void arm_system();
 void disarm_system();
-void handle_sensors(); // New function
+void handle_sensors(); 
 
 void setup() {
   Serial.begin(115200);
@@ -75,7 +69,6 @@ void setup() {
   }
 
   // Sensor Init
-  Wire.begin();
   dht.begin();
   // Allow sensors to settle
   delay(500);
@@ -84,7 +77,7 @@ void setup() {
 void loop() {
   unsigned long now = millis();
 
-  // 1. Read Serial (Byte by Byte) - Unchanged
+  // 1. Read Serial (Byte by Byte)
   while (Serial.available() > 0) {
     uint8_t byte_in = Serial.read();
     if (byte_in == 0x00) {
@@ -106,26 +99,21 @@ void loop() {
       break;
 
     case STATE_ARMING:
-      // Independent Task A: Wait for ESCs
       if (now - arming_start_time > ESC_BOOT_DELAY) {
         current_state = STATE_ARMED;
         last_packet_time = millis(); 
         Serial.println("ARM_CONFIRMED"); 
       }
-      // Independent Task B: Send Data (Handled below switch)
       break;
 
     case STATE_ARMED:
-      // Independent Task A: Watchdog
       if (now - last_packet_time > WATCHDOG_TIMEOUT) {
         disarm_system();
       }
-      // Independent Task B: Send Data (Handled below switch)
       break;
   }
 
   // 3. Independent Task: Sensor Telemetry
-  // Run this ONLY if handshake passed (ARMING or ARMED)
   if (current_state != STATE_IDLE) {
     if (now - last_sensor_time > SENSOR_INTERVAL) {
       handle_sensors();
@@ -139,28 +127,9 @@ void loop() {
   }
 }
 
-// --- SENSOR LOGIC (NEW) ---
+// --- SENSOR LOGIC ---
 void handle_sensors() {
-  // A. IMU Read
-  float roll = 0, pitch = 0, yaw = 0;
-  Wire.beginTransmission(IMU_ADDR);
-  Wire.write(REG_ANGLE);
-  if (Wire.endTransmission(false) == 0) {
-    Wire.requestFrom(IMU_ADDR, 6);
-    if (Wire.available() == 6) {
-      int16_t roll_raw  = Wire.read() | (Wire.read() << 8);
-      int16_t pitch_raw = Wire.read() | (Wire.read() << 8);
-      int16_t yaw_raw   = Wire.read() | (Wire.read() << 8);
-      
-      roll  = (float)roll_raw  / 32768.0 * 180.0;
-      pitch = (float)pitch_raw / 32768.0 * 180.0;
-      yaw   = (float)yaw_raw   / 32768.0 * 180.0;
-    }
-  }
-
-  // B. Voltage & DHT
-  // Note: DHT reading can be slow. If loop timing gets tight,
-  // put DHT in a separate timer to read only every 2 seconds.
+  // A. Voltage & DHT
   float h = dht.readHumidity();
   float t = dht.readTemperature();
   if (isnan(h) || isnan(t)) { h = 0; t = 0; }
@@ -168,21 +137,18 @@ void handle_sensors() {
   int rawVolt = analogRead(VOLT_PIN);
   float voltage = rawVolt * (5.0 / 1023.0) * DIVIDER_FACTOR;
 
-  // C. Pack Data
-  sensor_data.roll = roll;
-  sensor_data.pitch = pitch;
-  sensor_data.yaw = yaw;
+  // B. Pack Data
   sensor_data.temperature = t;
   sensor_data.humidity = h;
   sensor_data.voltage = voltage;
 
-  // D. Send Binary Packet (Header 0xAABB + Struct)
+  // C. Send Binary Packet (Header 0xAABB + Struct)
   Serial.write(0xAA); 
   Serial.write(0xBB);
   Serial.write((uint8_t*)&sensor_data, sizeof(sensor_data));
 }
 
-// --- LOGIC (EXISTING) ---
+// --- LOGIC ---
 
 void disarm_system() {
   current_state = STATE_IDLE;
@@ -200,7 +166,7 @@ void arm_system() {
   }
 }
 
-// --- COBS & PACKET HANDLING (EXISTING) ---
+// --- COBS & PACKET HANDLING ---
 
 void process_frame(uint8_t* buf, int len) {
   uint8_t decoded[64];
